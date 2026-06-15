@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amex Benefits Dashboard
 // @namespace    https://github.com/amex-benefits-dashboard
-// @version      1.0.0
+// @version      1.1.0
 // @author       jackie099
 // @description  Unified benefits credit tracker across all Amex cards
 // @match        https://global.americanexpress.com/*
