@@ -23,6 +23,9 @@
   // ============================================================
   const STORAGE_KEY_CARDS = 'amexDash_cardDetails';
   const STORAGE_KEY_TOKENS = 'amexDash_tokens';
+  // Tokens that the cached card details were last fetched for. Lets us notice
+  // when a newly added card introduces a token we haven't queried yet.
+  const STORAGE_KEY_CARDS_FETCHED_TOKENS = 'amexDash_cardsFetchedTokens';
   let interceptedCardDetails = [];
   let interceptedTokens = [];
 
@@ -46,21 +49,52 @@
   function pageFetch() {
     return (originalFetch || window.fetch).apply(window, arguments);
   }
-  function saveTokens(newTokens) {
-    var seen = {};
-    for (var i = 0; i < interceptedTokens.length; i++) seen[interceptedTokens[i]] = true;
-    var added = false;
-    for (var j = 0; j < newTokens.length; j++) {
-      var t = newTokens[j];
-      if (t.length >= 10 && t.length <= 20 && /^[A-Z0-9]+$/.test(t) && !seen[t]) {
-        seen[t] = true;
-        interceptedTokens.push(t);
-        added = true;
+
+  // An Amex account token is a 10–20 char uppercase alphanumeric string.
+  function isValidAccountToken(token) {
+    return typeof token === 'string' &&
+      token.length >= 10 && token.length <= 20 &&
+      /^[A-Z0-9]+$/.test(token);
+  }
+
+  // Read a localStorage value expected to hold a JSON array. Never throws.
+  function readJsonArray(key) {
+    try {
+      var parsed = JSON.parse(localStorage.getItem(key) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // Merge any number of token lists into a deduped array of valid tokens,
+  // preserving first-seen order.
+  function mergeTokens() {
+    var seen = Object.create(null);
+    var result = [];
+    for (var i = 0; i < arguments.length; i++) {
+      var list = arguments[i];
+      if (!Array.isArray(list)) continue;
+      for (var j = 0; j < list.length; j++) {
+        var token = list[j];
+        if (isValidAccountToken(token) && !seen[token]) {
+          seen[token] = true;
+          result.push(token);
+        }
       }
     }
-    if (added) {
-      console.debug('[AmexDash] Captured ' + interceptedTokens.length + ' account tokens');
-      try { localStorage.setItem(STORAGE_KEY_TOKENS, JSON.stringify(interceptedTokens)); } catch(e) {}
+    return result;
+  }
+
+  // Merge newly seen tokens with the in-memory set AND the persisted set, so a
+  // page that only exposes a subset of tokens never shrinks the stored union.
+  function saveTokens(newTokens) {
+    var stored = readJsonArray(STORAGE_KEY_TOKENS);
+    var merged = mergeTokens(stored, interceptedTokens, newTokens);
+    interceptedTokens = merged;
+    if (merged.length !== stored.length) {
+      console.debug('[AmexDash] Captured ' + merged.length + ' account tokens');
+      try { localStorage.setItem(STORAGE_KEY_TOKENS, JSON.stringify(merged)); } catch(e) {}
     }
   }
 
@@ -95,6 +129,7 @@
         var url = typeof arguments[0] === 'string' ? arguments[0] : (arguments[0] && arguments[0].url) || '';
         var opts = arguments[1] || {};
         var isAmexApi = url.indexOf('americanexpress.com') !== -1;
+        var requestTokens = [];
 
         if (!isAmexApi) {
           return originalFetch.apply(this, arguments);
@@ -105,7 +140,8 @@
           try {
             var bodyStr = typeof opts.body === 'string' ? opts.body : '';
             if (bodyStr.indexOf('accountToken') !== -1 || bodyStr.indexOf('Token') !== -1) {
-              saveTokens(extractTokensFromJson(bodyStr));
+              requestTokens = extractTokensFromJson(bodyStr);
+              saveTokens(requestTokens);
             }
           } catch(e) {}
         }
@@ -131,6 +167,18 @@
                     interceptedCardDetails = data.cardDetails;
                     console.debug('[AmexDash] Intercepted ' + data.cardDetails.length + ' card details from API');
                     try { localStorage.setItem(STORAGE_KEY_CARDS, JSON.stringify(data.cardDetails)); } catch(e) {}
+                    // Record the tokens this card set covers so getCardDetails can
+                    // trust the cache until a new (unqueried) token shows up.
+                    // Use ONLY the tokens this request actually queried — never the
+                    // global union, or a partial response would falsely look complete
+                    // and mask a newly added card. If unknown, skip and let
+                    // getCardDetails re-fetch against the full token set.
+                    try {
+                      var baseline = mergeTokens(requestTokens);
+                      if (baseline.length > 0) {
+                        localStorage.setItem(STORAGE_KEY_CARDS_FETCHED_TOKENS, JSON.stringify(baseline));
+                      }
+                    } catch(e) {}
                   }
                 }
               } catch(e) {}
@@ -400,63 +448,89 @@
   }
 
   /**
-   * Get card details from intercepted data, localStorage cache, DOM extraction, or API call.
-   * Returns array of card detail objects.
+   * Get card details for every known account.
+   *
+   * Reuses cached card details only while they remain complete — i.e. no token
+   * has been captured that wasn't part of the last card fetch (which is exactly
+   * what happens when a new card is added). Otherwise re-fetches
+   * ReadLoyaltyBenefitsCardProduct for the full union of known tokens. On
+   * failure it falls back to the stale cache rather than showing nothing.
+   *
+   * @param {boolean} forceRefresh  Bypass the cache and re-fetch (Refresh button).
+   * @returns {Promise<Array|null>} Card detail objects, or null if none available.
    */
-  async function getCardDetails() {
-    // 1. Try intercepted card details from this page load
+  async function getCardDetails(forceRefresh = false) {
+    // Union of every account token we've seen this session and in storage.
+    var knownTokens = mergeTokens(interceptedTokens, readJsonArray(STORAGE_KEY_TOKENS));
+
+    // Last-resort discovery when fetch interception never ran (e.g. strict CSP).
+    if (knownTokens.length === 0) {
+      var domTokens = extractTokensFromDOM();
+      if (domTokens.length > 0) {
+        saveTokens(domTokens);
+        knownTokens = mergeTokens(interceptedTokens, readJsonArray(STORAGE_KEY_TOKENS));
+      }
+    }
+
+    // Best available cached card set (in-memory beats persisted), if any.
+    var cachedCards = null;
+    var cacheSource = '';
     if (interceptedCardDetails.length > 0) {
-      console.debug('[AmexDash] Using intercepted card details:', interceptedCardDetails.length);
-      return interceptedCardDetails;
-    }
-
-    // 2. Try cached card details from localStorage
-    try {
-      var cached = localStorage.getItem(STORAGE_KEY_CARDS);
-      if (cached) {
-        var parsed = JSON.parse(cached);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          console.debug('[AmexDash] Using cached card details:', parsed.length);
-          return parsed;
-        }
-      }
-    } catch(e) {}
-
-    // 3. Try fetching card details using intercepted, cached, or DOM-extracted tokens
-    var tokens = interceptedTokens.length > 0 ? interceptedTokens : [];
-    if (tokens.length === 0) {
-      try {
-        var cachedTokens = localStorage.getItem(STORAGE_KEY_TOKENS);
-        if (cachedTokens) tokens = JSON.parse(cachedTokens);
-      } catch(e) {}
-    }
-    // Fallback: extract tokens from DOM (works even when fetch interception fails on Chrome)
-    if (tokens.length === 0) {
-      tokens = extractTokensFromDOM();
-      if (tokens.length > 0) {
-        saveTokens(tokens);
+      cachedCards = interceptedCardDetails;
+      cacheSource = 'intercepted';
+    } else {
+      var storedCards = readJsonArray(STORAGE_KEY_CARDS);
+      if (storedCards.length > 0) {
+        cachedCards = storedCards;
+        cacheSource = 'cached';
       }
     }
 
-    if (tokens.length > 0) {
-      console.debug('[AmexDash] Fetching card details using', tokens.length, 'captured tokens');
+    // Did a token appear that wasn't part of the last card fetch? -> new card.
+    var baseline = readJsonArray(STORAGE_KEY_CARDS_FETCHED_TOKENS);
+    var baselineSet = Object.create(null);
+    for (var i = 0; i < baseline.length; i++) baselineSet[baseline[i]] = true;
+    var hasNewToken = knownTokens.some(function (t) { return !baselineSet[t]; });
+
+    if (cachedCards && !forceRefresh && !hasNewToken) {
+      console.debug('[AmexDash] Using ' + cacheSource + ' card details:', cachedCards.length);
+      return cachedCards;
+    }
+
+    if (knownTokens.length > 0) {
+      var reason = forceRefresh ? 'forced refresh' : (hasNewToken ? 'new card detected' : 'no cache');
+      console.debug('[AmexDash] Fetching card details for ' + knownTokens.length + ' tokens (' + reason + ')');
       try {
         var data = await amexApiFetch('/ReadLoyaltyBenefitsCardProduct.v1', {
-          accountTokens: tokens,
+          accountTokens: knownTokens,
           cardNames: [],
           productType: 'AEXP_CARD_ACCOUNT',
         });
-        if (data && data.cardDetails && data.cardDetails.length > 0) {
+        if (data && Array.isArray(data.cardDetails) && data.cardDetails.length > 0) {
           interceptedCardDetails = data.cardDetails;
-          try { localStorage.setItem(STORAGE_KEY_CARDS, JSON.stringify(data.cardDetails)); } catch(e) {}
+          try {
+            localStorage.setItem(STORAGE_KEY_CARDS, JSON.stringify(data.cardDetails));
+            // Baseline = the tokens we queried, NOT only those that mapped to a
+            // card. A token with no card product (e.g. a non-card loyalty
+            // account) must be remembered too, or it would look "new" forever
+            // and trigger a re-fetch on every open.
+            localStorage.setItem(STORAGE_KEY_CARDS_FETCHED_TOKENS, JSON.stringify(knownTokens));
+          } catch(e) {}
+          console.debug('[AmexDash] Fetched ' + data.cardDetails.length + ' card details');
           return data.cardDetails;
         }
       } catch(e) {
+        if (e instanceof SessionExpiredError) throw e;
         console.warn('[AmexDash] Failed to fetch card details:', e.message);
       }
     }
 
-    // 4. No data at all
+    // Fetch unavailable or failed — prefer stale data over an empty dashboard.
+    if (cachedCards) {
+      console.warn('[AmexDash] Falling back to ' + cacheSource + ' card details:', cachedCards.length);
+      return cachedCards;
+    }
+
     console.warn('[AmexDash] No card data available');
     return null;
   }
@@ -1755,8 +1829,8 @@
     renderLoadingProgress(dashBody, 0, 0);
 
     try {
-      // Step 2: Get card details (from intercepted data or cache)
-      const cardDetails = await getCardDetails();
+      // Step 2: Get card details (cache when complete, else re-fetch all cards)
+      const cardDetails = await getCardDetails(forceRefresh);
       if (!cardDetails || cardDetails.length === 0) {
         dashBody.innerHTML = '';
         const msg = document.createElement('div');
@@ -1827,6 +1901,7 @@
         try {
           localStorage.removeItem(STORAGE_KEY_CARDS);
           localStorage.removeItem(STORAGE_KEY_TOKENS);
+          localStorage.removeItem(STORAGE_KEY_CARDS_FETCHED_TOKENS);
         } catch(e) {}
         interceptedCardDetails = [];
         interceptedTokens = [];
