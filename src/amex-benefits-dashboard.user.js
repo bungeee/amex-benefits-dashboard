@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amex Benefits Dashboard
 // @namespace    https://github.com/amex-benefits-dashboard
-// @version      1.1.0
+// @version      1.2.0
 // @author       jackie099
 // @description  Unified benefits credit tracker across all Amex cards
 // @match        https://global.americanexpress.com/*
@@ -35,7 +35,7 @@
     // Wait for fetch to become available, then patch
     Object.defineProperty(window, 'fetch', {
       configurable: true,
-      set: function(val) {
+      set: function (val) {
         originalFetch = val;
         delete window.fetch;
         installFetchInterceptor();
@@ -94,7 +94,7 @@
     interceptedTokens = merged;
     if (merged.length !== stored.length) {
       console.debug('[AmexDash] Captured ' + merged.length + ' account tokens');
-      try { localStorage.setItem(STORAGE_KEY_TOKENS, JSON.stringify(merged)); } catch(e) {}
+      try { localStorage.setItem(STORAGE_KEY_TOKENS, JSON.stringify(merged)); } catch (e) { }
     }
   }
 
@@ -124,11 +124,14 @@
       return;
     }
     console.debug('[AmexDash] Fetch interceptor installed');
-    window.fetch = function() {
+    window.fetch = function () {
       try {
         var url = typeof arguments[0] === 'string' ? arguments[0] : (arguments[0] && arguments[0].url) || '';
         var opts = arguments[1] || {};
         var isAmexApi = url.indexOf('americanexpress.com') !== -1;
+        if (url.indexOf('americanexpress.com') !== -1 || url.indexOf('aexp.com') !== -1) {
+          console.debug('[AmexDash] fetch seen:', url, opts.method || 'GET');
+        }
         var requestTokens = [];
 
         if (!isAmexApi) {
@@ -143,11 +146,11 @@
               requestTokens = extractTokensFromJson(bodyStr);
               saveTokens(requestTokens);
             }
-          } catch(e) {}
+          } catch (e) { }
         }
 
         // Inspect response bodies from endpoints that contain account data
-        return originalFetch.apply(this, arguments).then(function(response) {
+        return originalFetch.apply(this, arguments).then(function (response) {
           var shouldInspectResponse =
             url.indexOf('ReadLoyaltyBenefitsCardProduct') !== -1 ||
             url.indexOf('ReadLoyaltyAccounts') !== -1 ||
@@ -156,7 +159,7 @@
           if (!shouldInspectResponse) return response;
           try {
             var clone = response.clone();
-            clone.text().then(function(text) {
+            clone.text().then(function (text) {
               try {
                 if (text.indexOf('accountToken') !== -1) {
                   saveTokens(extractTokensFromJson(text));
@@ -166,7 +169,7 @@
                   if (data && data.cardDetails && data.cardDetails.length > 0) {
                     interceptedCardDetails = data.cardDetails;
                     console.debug('[AmexDash] Intercepted ' + data.cardDetails.length + ' card details from API');
-                    try { localStorage.setItem(STORAGE_KEY_CARDS, JSON.stringify(data.cardDetails)); } catch(e) {}
+                    try { localStorage.setItem(STORAGE_KEY_CARDS, JSON.stringify(data.cardDetails)); } catch (e) { }
                     // Record the tokens this card set covers so getCardDetails can
                     // trust the cache until a new (unqueried) token shows up.
                     // Use ONLY the tokens this request actually queried — never the
@@ -178,17 +181,17 @@
                       if (baseline.length > 0) {
                         localStorage.setItem(STORAGE_KEY_CARDS_FETCHED_TOKENS, JSON.stringify(baseline));
                       }
-                    } catch(e) {}
+                    } catch (e) { }
                   }
                 }
-              } catch(e) {}
-            }).catch(function(){});
-          } catch(e) {
+              } catch (e) { }
+            }).catch(function () { });
+          } catch (e) {
             // Never let interceptor processing errors affect the page's fetch
           }
           return response;
         });
-      } catch(e) {
+      } catch (e) {
         // Never break the page — fall through to original fetch
         return originalFetch.apply(this, arguments);
       }
@@ -335,7 +338,7 @@
           body: JSON.stringify(body),
         });
 
-        if (resp.status === 401 || resp.status === 403) {
+        /*if (resp.status === 401 || resp.status === 403) {
           throw new SessionExpiredError();
         }
 
@@ -348,7 +351,27 @@
           throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
         }
 
-        return await resp.json();
+        return await resp.json();*/
+        const text = await resp.text();
+
+        console.debug('[AmexDash] API response', {
+          endpoint,
+          status: resp.status,
+          statusText: resp.statusText,
+          bodyPreview: text.slice(0, 500),
+        });
+
+        if (resp.status === 401 || resp.status === 403) {
+          throw new SessionExpiredError(
+            `${endpoint} returned HTTP ${resp.status}: ${text.slice(0, 200)}`
+          );
+        }
+
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}: ${resp.statusText}: ${text.slice(0, 200)}`);
+        }
+
+        return JSON.parse(text);
       } catch (err) {
         lastError = err;
 
@@ -397,7 +420,17 @@
       if (tokens.length === 0) {
         try {
           var extractScript = document.createElement('script');
-          extractScript.textContent = '(' + function() {
+
+          var nonceEl = document.querySelector('script[nonce]');
+          var nonce = nonceEl && (nonceEl.nonce || nonceEl.getAttribute('nonce'));
+          if (nonce) {
+            extractScript.setAttribute('nonce', nonce);
+            console.debug('[AmexDash] Using page nonce for global-state extraction');
+          } else {
+            console.debug('[AmexDash] No page nonce found for global-state extraction');
+          }
+
+          extractScript.textContent = '(' + function () {
             try {
               var state = window.__INITIAL_STATE__ || window.__ONE_INITIAL_STATE__;
               if (state) {
@@ -417,16 +450,16 @@
                   document.documentElement.setAttribute('data-amexdash-tokens', JSON.stringify(tokens));
                 }
               }
-            } catch(e) {}
+            } catch (e) { }
           } + ')();';
           document.documentElement.appendChild(extractScript);
           extractScript.remove();
           var attr = document.documentElement.getAttribute('data-amexdash-tokens');
           if (attr) {
             document.documentElement.removeAttribute('data-amexdash-tokens');
-            try { tokens = JSON.parse(attr); } catch(e) {}
+            try { tokens = JSON.parse(attr); } catch (e) { }
           }
-        } catch(e) {
+        } catch (e) {
           // CSP blocked script injection — fall through to Method 3
         }
       }
@@ -438,7 +471,7 @@
           if (!seen[found[hi]]) { seen[found[hi]] = true; tokens.push(found[hi]); }
         }
       }
-    } catch(e) {
+    } catch (e) {
       console.warn('[AmexDash] DOM token extraction failed:', e.message);
     }
     if (tokens.length > 0) {
@@ -515,11 +548,11 @@
             // account) must be remembered too, or it would look "new" forever
             // and trigger a re-fetch on every open.
             localStorage.setItem(STORAGE_KEY_CARDS_FETCHED_TOKENS, JSON.stringify(knownTokens));
-          } catch(e) {}
+          } catch (e) { }
           console.debug('[AmexDash] Fetched ' + data.cardDetails.length + ' card details');
           return data.cardDetails;
         }
-      } catch(e) {
+      } catch (e) {
         if (e instanceof SessionExpiredError) throw e;
         console.warn('[AmexDash] Failed to fetch card details:', e.message);
       }
@@ -540,27 +573,37 @@
    * Calls ReadLoyaltyAccounts.v1.
    */
   async function fetchLoyaltyAccounts(accountTokens) {
-    const body = {
-      accountTokens: Array.isArray(accountTokens) ? accountTokens : [accountTokens],
-      productType: 'AEXP_CARD_ACCOUNT',
-    };
-    const data = await amexApiFetch(
-      '/ReadLoyaltyAccounts.v1',
-      body
-    );
-    // data is an array; extract relationships from all entries
+    const tokens = Array.isArray(accountTokens) ? accountTokens : [accountTokens];
     const displayMap = {};
-    if (Array.isArray(data)) {
-      for (const entry of data) {
-        if (Array.isArray(entry.relationships)) {
-          for (const rel of entry.relationships) {
-            if (rel.accountToken && rel.displayAccountNumber) {
-              displayMap[rel.accountToken] = rel.displayAccountNumber;
+
+    for (const token of tokens) {
+      try {
+        const data = await amexApiFetch('/ReadLoyaltyAccounts.v1', {
+          accountTokens: [token],
+          productType: 'AEXP_CARD_ACCOUNT',
+        });
+
+        if (Array.isArray(data)) {
+          for (const entry of data) {
+            if (Array.isArray(entry.relationships)) {
+              for (const rel of entry.relationships) {
+                if (rel.accountToken && rel.displayAccountNumber) {
+                  displayMap[rel.accountToken] = rel.displayAccountNumber;
+                }
+              }
             }
           }
         }
+      } catch (err) {
+        if (/access_denied|Provided tokens not authorized|IC_UE_POLICY_EXECUTION_FAILED/i.test(err.message)) {
+          console.warn('[AmexDash] Token not authorized for display number:', token.slice(0, 6), err.message);
+          continue;
+        }
+
+        throw err;
       }
     }
+
     return displayMap;
   }
 
@@ -592,7 +635,18 @@
         return { accountToken, trackers: [], error: null };
       } catch (err) {
         if (onComplete) onComplete();
-        if (err instanceof SessionExpiredError) throw err;
+        if (err instanceof SessionExpiredError) {
+          if (/access_denied|Provided tokens not authorized|IC_UE_POLICY_EXECUTION_FAILED/i.test(err.message)) {
+            console.warn('[AmexDash] Token not authorized for trackers:', accountToken.slice(0, 6), err.message);
+            return {
+              accountToken,
+              trackers: [],
+              error: 'Token not authorized for benefit trackers',
+            };
+          }
+
+          throw err;
+        }
         if (err instanceof RateLimitError) pool.onRateLimit();
         console.error(`[AmexDash] Failed to fetch trackers for ${accountToken}:`, err);
         return { accountToken, trackers: [], error: err.message };
@@ -693,7 +747,7 @@
   function getHistory() {
     try {
       return JSON.parse(localStorage.getItem(STORAGE_KEY_HISTORY) || '{}');
-    } catch(e) { return {}; }
+    } catch (e) { return {}; }
   }
 
   function selfTrackPeriod(benefitId, accountToken, periodKey, spent) {
@@ -714,7 +768,7 @@
       }
     }
 
-    try { localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(history)); } catch(e) {}
+    try { localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(history)); } catch (e) { }
   }
 
   function getSelfTrackedYtd(benefitId, accountToken) {
@@ -755,7 +809,7 @@
 
       // Per-card tracker breakdown (debug level — hidden by default in console)
       var cats = {};
-      result.trackers.forEach(function(_t) { cats[_t.category] = (cats[_t.category] || 0) + 1; });
+      result.trackers.forEach(function (_t) { cats[_t.category] = (cats[_t.category] || 0) + 1; });
       console.debug('[AmexDash] ' + cardInfo.label + ': ' + result.trackers.length + ' trackers', cats);
 
       for (const t of result.trackers) {
@@ -1384,8 +1438,8 @@
       <div class="amex-dash-header-left">
         <h1>All Benefits</h1>
         ${subtitleParts.length > 0
-          ? `<div class="amex-dash-header-subtitle">${escapeHtml(subtitleParts.join(' \u00b7 '))}</div>`
-          : ''}
+        ? `<div class="amex-dash-header-subtitle">${escapeHtml(subtitleParts.join(' \u00b7 '))}</div>`
+        : ''}
       </div>
       <div class="amex-dash-header-right">
         ${statsHtml}
@@ -1464,16 +1518,30 @@
     container.appendChild(el);
   }
 
-  function renderCardErrors(dashBody, trackerResults) {
+  function renderCardErrors(dashBody, trackerResults, cardDetails, displayNumberMap) {
     const errors = trackerResults.filter((r) => r.error);
     if (errors.length === 0) return;
+
+    const cardInfoMap = buildCardInfoMap(cardDetails || [], displayNumberMap || {});
 
     const el = document.createElement('div');
     el.className = 'amex-dash-card-errors';
     el.innerHTML = `
-      <strong>Some cards failed to load (${errors.length}):</strong>
-      ${errors.map((e) => `<div>${escapeHtml(e.accountToken.slice(0, 6))}...: ${escapeHtml(e.error)}</div>`).join('')}
-    `;
+    <strong>Some cards failed to load (${errors.length}):</strong>
+    ${errors.map((e) => {
+      const info = cardInfoMap[e.accountToken];
+      const label = info
+        ? [
+          info.label || info.displayName || info.cardName,
+          info.cardType,
+          info.relationship,
+          e.accountToken.slice(0, 6) + '...',
+        ].filter(Boolean).join(' | ')
+        : e.accountToken.slice(0, 6) + '...';
+
+      return `<div>${escapeHtml(label)}: ${escapeHtml(e.error)}</div>`;
+    }).join('')}
+  `;
     dashBody.prepend(el);
   }
 
@@ -1670,8 +1738,8 @@
     // Period label for the progress text
     const periodWord = benefit.durationLabel === 'Monthly' ? 'this month'
       : benefit.durationLabel === 'Quarterly' ? 'this quarter'
-      : benefit.durationLabel === 'Semi-Annual' ? 'this half'
-      : 'this year';
+        : benefit.durationLabel === 'Semi-Annual' ? 'this half'
+          : 'this year';
 
     const row = document.createElement('div');
     row.className = `amex-dash-benefit-row color-border-${colorClass}`;
@@ -1770,15 +1838,15 @@
       'border-radius:28px;cursor:pointer;font-size:15px;font-weight:600;' +
       'box-shadow:0 4px 16px rgba(0,111,207,0.4);transition:all 0.2s;' +
       'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;';
-    btn.addEventListener('mouseenter', function() {
+    btn.addEventListener('mouseenter', function () {
       btn.style.transform = 'scale(1.05)';
       btn.style.boxShadow = '0 6px 20px rgba(0,111,207,0.5)';
     });
-    btn.addEventListener('mouseleave', function() {
+    btn.addEventListener('mouseleave', function () {
       btn.style.transform = 'scale(1)';
       btn.style.boxShadow = '0 4px 16px rgba(0,111,207,0.4)';
     });
-    btn.addEventListener('click', function(e) {
+    btn.addEventListener('click', function (e) {
       e.preventDefault();
       navigateToDashboard();
     });
@@ -1850,7 +1918,7 @@
       let displayNumberMap = {};
       try {
         if (cardDetails.length > 0) {
-          displayNumberMap = await fetchLoyaltyAccounts(cardDetails.map(function(c) { return c.accountToken; }));
+          displayNumberMap = await fetchLoyaltyAccounts(cardDetails.map(function (c) { return c.accountToken; }));
         }
       } catch (err) {
         console.warn('[AmexDash] Could not fetch display numbers:', err.message);
@@ -1890,7 +1958,7 @@
       renderResults(dashBody, grouped, summary);
 
       // Step 9: Show any card errors
-      renderCardErrors(dashBody, trackerResults);
+      renderCardErrors(dashBody, trackerResults, cardDetails, displayNumberMap);
 
       console.log(`[AmexDash] Dashboard rendered: ${grouped.size} benefits across ${cardDetails.length} cards`);
     } catch (err) {
@@ -1898,11 +1966,11 @@
 
       if (err instanceof SessionExpiredError) {
         // Clear stale cached data so next attempt uses fresh tokens
-        try {
+        /*try {
           localStorage.removeItem(STORAGE_KEY_CARDS);
           localStorage.removeItem(STORAGE_KEY_TOKENS);
           localStorage.removeItem(STORAGE_KEY_CARDS_FETCHED_TOKENS);
-        } catch(e) {}
+        } catch(e) {}*/
         interceptedCardDetails = [];
         interceptedTokens = [];
         dashboardActive = false;
@@ -1915,7 +1983,7 @@
           '<p style="margin-top:8px;">Navigate to any <a href="/card-benefits/view-all/platinum" style="color:#006fcf">benefits page</a> to refresh card data, then try again.</p>' +
           '<p style="margin-top:12px;"><button id="amex-dash-retry" style="background:#006fcf;color:#fff;border:none;padding:8px 20px;border-radius:4px;cursor:pointer;font-size:14px;">Retry Now</button></p>';
         dashBody.appendChild(errEl);
-        document.getElementById('amex-dash-retry').addEventListener('click', function() {
+        document.getElementById('amex-dash-retry').addEventListener('click', function () {
           showDashboard(true);
         });
       } else {
@@ -2005,7 +2073,7 @@
       // Retry button injection if body wasn't ready
       if (!document.getElementById('amex-dash-nav-link')) {
         var retryCount = 0;
-        var retryInterval = setInterval(function() {
+        var retryInterval = setInterval(function () {
           retryCount++;
           injectNavLink();
           if (document.getElementById('amex-dash-nav-link') || retryCount > 20) {
@@ -2015,7 +2083,7 @@
       }
 
       console.log('[AmexDash] Ready');
-    } catch(e) {
+    } catch (e) {
       console.error('[AmexDash] Init failed:', e);
     }
   }
@@ -2026,7 +2094,7 @@
     init();
   } else {
     console.debug('[AmexDash] Waiting for DOMContentLoaded...');
-    document.addEventListener('DOMContentLoaded', function() {
+    document.addEventListener('DOMContentLoaded', function () {
       console.debug('[AmexDash] DOMContentLoaded fired');
       init();
     });
