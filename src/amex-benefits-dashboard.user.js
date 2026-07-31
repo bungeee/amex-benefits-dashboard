@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amex Benefits Dashboard
 // @namespace    https://github.com/amex-benefits-dashboard
-// @version      1.2.0
+// @version      1.2.1
 // @author       jackie099
 // @description  Unified benefits credit tracker across all Amex cards
 // @match        https://global.americanexpress.com/*
@@ -96,6 +96,32 @@
       console.debug('[AmexDash] Captured ' + merged.length + ' account tokens');
       try { localStorage.setItem(STORAGE_KEY_TOKENS, JSON.stringify(merged)); } catch (e) { }
     }
+  }
+
+  function isTokenAuthorizationError(err) {
+    return err instanceof SessionExpiredError &&
+      /access_denied|Provided tokens not authorized|IC_UE_POLICY_EXECUTION_FAILED/i.test(err.message);
+  }
+
+  function pruneStoredTokens(tokensToRemove) {
+    var blocked = Object.create(null);
+    for (var i = 0; i < tokensToRemove.length; i++) {
+      if (isValidAccountToken(tokensToRemove[i])) blocked[tokensToRemove[i]] = true;
+    }
+
+    function keepAuthorized(token) {
+      return !blocked[token];
+    }
+
+    interceptedTokens = interceptedTokens.filter(keepAuthorized);
+
+    try {
+      localStorage.setItem(STORAGE_KEY_TOKENS, JSON.stringify(readJsonArray(STORAGE_KEY_TOKENS).filter(keepAuthorized)));
+      localStorage.setItem(STORAGE_KEY_CARDS_FETCHED_TOKENS, JSON.stringify(readJsonArray(STORAGE_KEY_CARDS_FETCHED_TOKENS).filter(keepAuthorized)));
+      localStorage.setItem(STORAGE_KEY_CARDS, JSON.stringify(readJsonArray(STORAGE_KEY_CARDS).filter(function (card) {
+        return card && keepAuthorized(card.accountToken);
+      })));
+    } catch (e) { }
   }
 
   function extractTokensFromJson(str) {
@@ -553,6 +579,58 @@
           return data.cardDetails;
         }
       } catch (e) {
+        if (isTokenAuthorizationError(e)) {
+          console.warn('[AmexDash] Card details batch included an unauthorized token; probing individually');
+          var recoveredCards = [];
+          var authorizedTokens = [];
+          var unauthorizedTokens = [];
+
+          for (var ti = 0; ti < knownTokens.length; ti++) {
+            var token = knownTokens[ti];
+            try {
+              var singleData = await amexApiFetch('/ReadLoyaltyBenefitsCardProduct.v1', {
+                accountTokens: [token],
+                cardNames: [],
+                productType: 'AEXP_CARD_ACCOUNT',
+              });
+              if (singleData && Array.isArray(singleData.cardDetails) && singleData.cardDetails.length > 0) {
+                authorizedTokens.push(token);
+                recoveredCards = recoveredCards.concat(singleData.cardDetails);
+              } else {
+                authorizedTokens.push(token);
+              }
+            } catch (singleErr) {
+              if (isTokenAuthorizationError(singleErr)) {
+                unauthorizedTokens.push(token);
+                console.warn('[AmexDash] Pruning unauthorized token:', token.slice(0, 6));
+              } else {
+                console.warn('[AmexDash] Failed to probe token:', token.slice(0, 6), singleErr.message);
+              }
+            }
+          }
+
+          if (unauthorizedTokens.length > 0) {
+            pruneStoredTokens(unauthorizedTokens);
+          }
+
+          if (recoveredCards.length > 0) {
+            interceptedCardDetails = recoveredCards;
+            interceptedTokens = mergeTokens(authorizedTokens);
+            try {
+              localStorage.setItem(STORAGE_KEY_CARDS, JSON.stringify(recoveredCards));
+              localStorage.setItem(STORAGE_KEY_TOKENS, JSON.stringify(authorizedTokens));
+              localStorage.setItem(STORAGE_KEY_CARDS_FETCHED_TOKENS, JSON.stringify(authorizedTokens));
+            } catch (storageErr) { }
+            console.debug('[AmexDash] Recovered ' + recoveredCards.length + ' card details after pruning ' + unauthorizedTokens.length + ' unauthorized tokens');
+            return recoveredCards;
+          }
+
+          if (cachedCards) {
+            console.warn('[AmexDash] Falling back to ' + cacheSource + ' card details after token authorization recovery failed:', cachedCards.length);
+            return cachedCards;
+          }
+          throw e;
+        }
         if (e instanceof SessionExpiredError) throw e;
         console.warn('[AmexDash] Failed to fetch card details:', e.message);
       }
